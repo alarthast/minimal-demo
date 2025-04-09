@@ -54,3 +54,13 @@ extend-ignore = [
 
 [tool.ruff.lint.isort]
 lines-after-imports = 2
+
+[dependency-groups]
+dev = [
+    "coverage",
+    "pip-tools",
+    "pre-commit",
+    "pytest",
+    "pyyaml",
+    "ruff",
+]
