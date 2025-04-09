@@ -3,7 +3,7 @@ export VIRTUAL_ENV  := env_var_or_default("VIRTUAL_ENV", ".venv")
 export BIN := VIRTUAL_ENV + if os_family() == "unix" { "/bin" } else { "/Scripts" }
 export PIP := BIN + if os_family() == "unix" { "/python -m pip" } else { "/python.exe -m pip" }
 
-export DEFAULT_PYTHON := if os_family() == "unix" { "python3.11" } else { "python" }
+export DEFAULT_PYTHON := if os_family() == "unix" { `cat .python-version` } else { "python" }
 
 
 # list available commands
@@ -17,57 +17,55 @@ clean:
 
 
 # ensure valid virtualenv
-virtualenv:
+virtualenv *args:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    # allow users to specify python version in .env
+    # Allow users to specify python version in .env
     PYTHON_VERSION=${PYTHON_VERSION:-$DEFAULT_PYTHON}
 
-    # create venv and upgrade pip
-    test -d $VIRTUAL_ENV || { $PYTHON_VERSION -m venv $VIRTUAL_ENV && $PIP install --upgrade pip; }
+    # Create venv; installs `uv`-managed python if python interpreter not found
+    test -d $VIRTUAL_ENV || uv venv --python $PYTHON_VERSION {{ args }}
 
-    # ensure we have pip-tools so we can run pip-compile
-    test -e $BIN/pip-compile || $PIP install pip-tools
+    # Block accidentally usage of system pip by placing an executable at .venv/bin/pip
+    echo 'echo "pip is not installed: use uv pip for a pip-like interface."' > .venv/bin/pip
+    chmod +x .venv/bin/pip
 
 
-_compile src dst *args: virtualenv
+# Wrap `uv` commands that alter the lockfile
+_uv $args: virtualenv
     #!/usr/bin/env bash
     set -euo pipefail
 
-    # exit if src file is older than dst file (-nt = 'newer than', but we negate with || to avoid error exit code)
-    test "${FORCE:-}" = "true" -o {{ src }} -nt {{ dst }} || exit 0
-    $BIN/pip-compile --allow-unsafe --generate-hashes --output-file={{ dst }} {{ src }} {{ args }}
+    LOCKFILE_TIMESTAMP=$(grep -n exclude-newer uv.lock | cut -d'=' -f2 | cut -d'"' -f2) || LOCKFILE_TIMESTAMP=""
+    UV_EXCLUDE_NEWER=${UV_EXCLUDE_NEWER:-$LOCKFILE_TIMESTAMP}
+
+    if [ -n "${UV_EXCLUDE_NEWER}" ]; then
+        # echo "Using uv with UV_EXCLUDE_NEWER=${UV_EXCLUDE_NEWER}."
+        export UV_EXCLUDE_NEWER
+    else
+        unset UV_EXCLUDE_NEWER
+    fi
+
+    uv $args
+
+# update uv.lock if dependencies in pyproject.toml have changed
+requirements-prod *args: (_uv "lock " + args)
 
 
-# update requirements.prod.txt if requirements.prod.in has changed
-requirements-prod *args: (_compile 'requirements.prod.in' 'requirements.prod.txt' args)
-
-
-# update requirements.dev.txt if requirements.dev.in has changed
-requirements-dev *args: requirements-prod (_compile 'requirements.dev.in' 'requirements.dev.txt' args)
-
-
-_install env:
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    # exit if .txt file has not changed since we installed them (-nt == "newer than', but we negate with || to avoid error exit code)
-    test requirements.{{ env }}.txt -nt $VIRTUAL_ENV/.{{ env }} || exit 0
-
-    $PIP install -r requirements.{{ env }}.txt
-    touch $VIRTUAL_ENV/.{{ env }}
+# update uv.lock if dependencies in pyproject.toml have changed
+requirements-dev *args: (_uv "lock " + args)
 
 
 # ensure prod requirements installed and up to date
-prodenv: requirements-prod (_install 'prod')
+prodenv: requirements-prod (_uv "sync --frozen --no-dev")
 
 
 # && dependencies are run after the recipe has run. Needs just>=0.9.9. This is
 # a killer feature over Makefiles.
 #
 # ensure dev requirements installed and up to date
-devenv: prodenv requirements-dev (_install 'dev') && install-precommit
+devenv: requirements-dev (_uv "sync --frozen") && install-precommit
 
 
 # ensure precommit is installed
@@ -79,22 +77,54 @@ install-precommit:
     test -f $BASE_DIR/.git/hooks/pre-commit || $BIN/pre-commit install
 
 
-# upgrade dev or prod dependencies (specify package to upgrade single package, all by default)
+# upgrade dev and prod dependencies (specify package to upgrade single package, all by default)
 upgrade env package="": virtualenv
     #!/usr/bin/env bash
     set -euo pipefail
 
     opts="--upgrade"
     test -z "{{ package }}" || opts="--upgrade-package {{ package }}"
-    FORCE=true "{{ just_executable() }}" requirements-{{ env }} $opts
+
+    LOCKFILE_TIMESTAMP=$(grep -n exclude-newer uv.lock | cut -d'=' -f2 | cut -d'"' -f2) || LOCKFILE_TIMESTAMP=""
+    if [ -z "${LOCKFILE_TIMESTAMP}" ]; then
+        uv lock $opts
+    else
+        uv lock --exclude-newer $LOCKFILE_TIMESTAMP $opts
+    fi
 
 
 # Upgrade all dev and prod dependencies.
 # This is the default input command to update-dependencies action
 # https://github.com/bennettoxford/update-dependencies-action
-update-dependencies:
-    just upgrade prod
-    just upgrade dev
+# Format of "date" argument should matches linux date command's --date flag
+update-dependencies date="": virtualenv
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    LOCKFILE_TIMESTAMP=$(grep -n exclude-newer uv.lock | cut -d'=' -f2 | cut -d'"' -f2) || LOCKFILE_TIMESTAMP=""
+    if [ -z "{{ date }}" ]; then
+        UV_EXCLUDE_NEWER=${UV_EXCLUDE_NEWER:-$LOCKFILE_TIMESTAMP}
+    else
+        UV_EXCLUDE_NEWER=${UV_EXCLUDE_NEWER:-$(date -d "{{ date }}" +"%Y-%m-%dT%H:%M:%SZ")}
+    fi
+
+    if [ -n "${UV_EXCLUDE_NEWER}" ]; then
+        if [ -n "${LOCKFILE_TIMESTAMP}" ]; then
+            touch -d "$UV_EXCLUDE_NEWER" $VIRTUAL_ENV/.target
+            touch -d "$LOCKFILE_TIMESTAMP" $VIRTUAL_ENV/.existing
+            if [ $VIRTUAL_ENV/.existing -nt $VIRTUAL_ENV/.target ]; then
+                echo "The lockfile timestamp is newer than the target cutoff. Using the lockfile timestamp."
+                UV_EXCLUDE_NEWER=$LOCKFILE_TIMESTAMP
+            fi
+        fi
+        echo "UV_EXCLUDE_NEWER set to $UV_EXCLUDE_NEWER."
+        export UV_EXCLUDE_NEWER
+    else
+        echo "UV_EXCLUDE_NEWER not set."
+        unset UV_EXCLUDE_NEWER
+    fi
+
+    uv lock --upgrade
 
 # *args is variadic, 0 or more. This allows us to do `just test -k match`, for example.
 # Run the tests
